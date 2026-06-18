@@ -1,6 +1,5 @@
 import { Context, Schema, h } from 'koishi'
 
-export const name = 'phimg2'
 export const inject = ['database', 'http']
 
 declare module 'koishi' {
@@ -125,11 +124,12 @@ export function apply(ctx: Context, config: Config) {
 
       return responseData
     } catch (error) {
+      const err = error as any
       if (config.showErrorLog) {
-        ctx.logger('phimg').warn(`API Error: ${error.message}`)
+        ctx.logger('phimg').warn(`API Error: ${err?.message}`)
       }
-      if (error.response?.status === 404) throw new Error('未找到匹配的图片')
-      throw new Error(error.message || 'API 请求失败')
+      if (err?.response?.status === 404) throw new Error('未找到匹配的图片')
+      throw new Error(err?.message || 'API 请求失败')
     }
   }
 
@@ -187,17 +187,28 @@ Phimg for Koishi @ CyanFlow`
     .action(async ({ session, options }, ...paramsArray) => {
       if (!session?.guildId) return '搜图仅限群聊使用。'
 
+      const opts = (options ?? {}) as {
+        tags?: boolean
+        status?: boolean
+        pp?: number
+        p?: number
+        sf?: string
+        sd?: string
+        i?: number
+      }
+      const content = session.content ?? ''
       const rawParams = paramsArray.join(' ')
-      const hasImageInContent = !!(h.select(session.content, 'image')[0] || h.select(session.content, 'img')[0])
-      if (!rawParams && !session.quote && !hasImageInContent && !options.tags && !options.status) return searchHelp
-      
+      // 更新帮助逻辑：如果没参数、没引用、当前消息也没图片、没选项，则显示帮助
+      const hasImageInContent = !!(h.select(content, 'image')[0] || h.select(content, 'img')[0])
+      if (!rawParams && !session.quote && !hasImageInContent && !opts.tags && !opts.status) return searchHelp
+
       const groupId = session.guildId
       const groupConfig = await getGroupConfig(groupId)
 
-      if (options.status) {
+      if (opts.status) {
         return `当前群聊搜图功能状态：\n启用：${groupConfig.enabled}\n标签：${groupConfig.customTags.join(', ') || '无'}\n全局标签：${groupConfig.useGlobalTags ? '启用' : '禁用'}`
       }
-      if (options.tags) {
+      if (opts.tags) {
         return `当前群聊内置标签：${groupConfig.customTags.join(', ') || '无'}`
       }
       if (!groupConfig.enabled) {
@@ -206,16 +217,17 @@ Phimg for Koishi @ CyanFlow`
 
       const paramsText = translateText(rawParams || '')
       const cleanParams = paramsText.replace(/<[^>]+>/g, '').trim()
-      
+
       let imageUrl: string | undefined
       // 1. 优先检查引用消息中的图片
       if (session.quote) {
-        const img = h.select(session.quote.content, 'image')[0] || h.select(session.quote.content, 'img')[0]
+        const quoteContent = session.quote.content ?? ''
+        const img = h.select(quoteContent, 'image')[0] || h.select(quoteContent, 'img')[0]
         if (img) imageUrl = img.attrs.url || img.attrs.src
       }
       // 2. 如果引用没图片，检查当前指令消息中是否附带了图片
       if (!imageUrl) {
-        const img = h.select(session.content, 'image')[0] || h.select(session.content, 'img')[0]
+        const img = h.select(content, 'image')[0] || h.select(content, 'img')[0]
         if (img) imageUrl = img.attrs.url || img.attrs.src
       }
 
@@ -239,11 +251,11 @@ Phimg for Koishi @ CyanFlow`
 
           const data = await makeRequest('reverse', queryParams)
           const images = data.images
-          
+
           if (images.length > 10) return `搜索到过多图片 (${images.length} 张)，请尝试减小距离参数。`
           if (images.length === 0) return '未找到匹配的图片'
 
-          const result = [h('at', { id: session.userId }), h.text(`\ndistance: ${distance}\n`)]
+          const result: h[] = [h('at', { id: session.userId }), h.text(`\ndistance: ${distance}\n`)]
           for (const img of images) {
             result.push(getMediaElement(img))
             result.push(h.text(`\nid: ${img.id} | score: ${img.score}\n`))
@@ -258,19 +270,20 @@ Phimg for Koishi @ CyanFlow`
 
           if (allTags.length === 0) return '请输入搜索标签。'
 
+          const perPage = opts.pp ?? 50
           const queryParams: any = {
             q: allTags.join(', '),
             key: config.apiKey,
-            per_page: options.pp,
-            page: options.p,
-            sf: options.sf,
-            sd: options.sd,
+            per_page: perPage,
+            page: opts.p ?? 1,
+            sf: opts.sf ?? 'score',
+            sd: opts.sd ?? 'desc',
           }
 
           const data = await makeRequest('images', queryParams)
           const images = data.images
 
-          let index = options.i
+          let index = opts.i ?? -1
           let additionalMsg = ''
           if (index < 0 || index >= images.length) {
             if (index >= 0) additionalMsg = `索引 ${index} 超出单页范围，已随机选择图片`
@@ -278,13 +291,14 @@ Phimg for Koishi @ CyanFlow`
           }
 
           const selected = images[index]
-          return [
+          const result: h[] = [
             h('at', { id: session.userId }),
             getMediaElement(selected),
             h.text(`\nid: ${selected.id} | score: ${selected.score}`),
             h.text(`\ntags: ${queryParams.q}`),
-            additionalMsg ? h.text(`\n提示：${additionalMsg}`) : null
           ]
+          if (additionalMsg) result.push(h.text(`\n提示：${additionalMsg}`))
+          return result
         }
       } catch (error) {
         return error instanceof Error ? error.message : String(error)
@@ -302,28 +316,36 @@ Phimg for Koishi @ CyanFlow`
     .option('rm', '--rm <tags:string>')
     .action(async ({ session, options }) => {
       if (!session?.guildId) return '搜图配置仅限群聊使用。'
-      if (Object.keys(options).length === 0) return configHelp
+      const opts = (options ?? {}) as {
+        on?: boolean
+        off?: boolean
+        onglobal?: boolean
+        offglobal?: boolean
+        add?: string
+        rm?: string
+      }
+      if (Object.keys(opts).length === 0) return configHelp
 
       const groupId = session.guildId
       const groupConfig = await getGroupConfig(groupId)
       let response = ''
 
-      if (options.on && options.off) return '不能同时开启和关闭搜图功能'
+      if (opts.on && opts.off) return '不能同时开启和关闭搜图功能'
 
-      if (options.on) {
+      if (opts.on) {
         await updateGroupConfig(groupId, { enabled: true })
         response += '搜图功能已在本群开启\n'
-      } else if (options.off) {
+      } else if (opts.off) {
         await updateGroupConfig(groupId, { enabled: false })
         response += '搜图功能已在本群关闭\n'
       }
 
-      if (options.onglobal && options.offglobal) return '不能同时开启和关闭全局标签'
+      if (opts.onglobal && opts.offglobal) return '不能同时开启和关闭全局标签'
 
-      if (options.onglobal) {
+      if (opts.onglobal) {
         await updateGroupConfig(groupId, { useGlobalTags: true })
         response += '全局标签已启用\n'
-      } else if (options.offglobal) {
+      } else if (opts.offglobal) {
         const confirmKey = `${session.guildId}-${session.userId}`
         if (!confirmOffGlobal.has(confirmKey)) {
           confirmOffGlobal.add(confirmKey)
@@ -335,14 +357,14 @@ Phimg for Koishi @ CyanFlow`
         response += '全局标签已禁用\n'
       }
 
-      if (options.add || options.rm) {
+      if (opts.add || opts.rm) {
         let newTags = [...groupConfig.customTags]
-        if (options.add) {
-          const tagsToAdd = translateText(options.add).split(/[,，]/).map(t => t.trim()).filter(t => t)
+        if (opts.add) {
+          const tagsToAdd = translateText(opts.add).split(/[,，]/).map(t => t.trim()).filter(t => t)
           newTags = [...new Set([...newTags, ...tagsToAdd])]
         }
-        if (options.rm) {
-          const tagsToRm = translateText(options.rm).split(/[,，]/).map(t => t.trim()).filter(t => t)
+        if (opts.rm) {
+          const tagsToRm = translateText(opts.rm).split(/[,，]/).map(t => t.trim()).filter(t => t)
           newTags = newTags.filter(t => !tagsToRm.includes(t))
         }
         await updateGroupConfig(groupId, { customTags: newTags })
