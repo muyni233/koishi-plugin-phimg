@@ -1,16 +1,22 @@
-import { Context, Schema, segment, User } from 'koishi'
-import axios from 'axios'
-import { randomInt } from 'crypto'
-export const inject = ['database']
+import { Context, Schema, h } from 'koishi'
+
+export const inject = ['database', 'http']
 
 declare module 'koishi' {
   interface Tables {
     phimg_config: GroupConfig
   }
+}
 
-  interface User {
-    authority: number
-  }
+const translationTable: Record<string, string> = {
+  '；': ';', '：': ':', '，': ',', '（': '(', '）': ')',
+  '【': '[', '】': ']', '《': '<', '》': '>', '？': '?',
+  '！': '!', '。': '.', '、': ',',
+}
+
+function translateText(text: string) {
+  if (!text) return text
+  return text.split('').map(char => translationTable[char] || char).join('')
 }
 
 export interface Config {
@@ -19,33 +25,29 @@ export interface Config {
   defaultTags: string[]
   enabledByDefault: boolean
   useGlobalTagsByDefault: boolean
-  proxy: string
+  filterId: number
+  showErrorLog: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
-  apiKey: Schema.string().description('Philomena API 密钥').default(''),
-  apiUrl: Schema.string().description('Philomena API 链接').default('https://derpibooru.org/api/v1/json/search/images?'),
-  defaultTags: Schema.array(String).description('全局标签').default(['safe']),
-  enabledByDefault: Schema.boolean().description('默认启用搜图功能').default(true),
-  useGlobalTagsByDefault: Schema.boolean().description('默认启用全局标签').default(true),
-  proxy: Schema.string().description('代理服务器').default(''),
+  apiKey: Schema.string().description('Philomena API 密钥').role('secret').default(''),
+  apiUrl: Schema.string().description('Philomena 图站域名').default('derpibooru.org'),
+  defaultTags: Schema.array(String).description('全局默认标签').default(['safe']),
+  enabledByDefault: Schema.boolean().description('新群聊默认启用搜图功能').default(true),
+  useGlobalTagsByDefault: Schema.boolean().description('新群聊默认启用全局标签').default(true),
+  filterId: Schema.number().description('搜索使用的 Filter ID (例如 100073)').default(100073),
+  showErrorLog: Schema.boolean().description('是否在控制台输出搜图失败的日志').default(false),
 })
 
-interface GroupConfig extends Record<string, any> {
-  id?: number
+interface GroupConfig {
+  id: number
   groupId: string
   enabled: boolean
   useGlobalTags: boolean
   customTags: string[]
-  [Symbol.iterator]?: never
 }
 
 export function apply(ctx: Context, config: Config) {
-  if (!ctx.database) {
-    ctx.logger.warn('数据库未启用，无法使用Phimg')
-    return
-  }
-  
   ctx.model.extend('phimg_config', {
     id: 'unsigned',
     groupId: 'string',
@@ -59,192 +61,316 @@ export function apply(ctx: Context, config: Config) {
   })
 
   const getGroupConfig = async (groupId: string): Promise<GroupConfig> => {
-    const [groupConfig] = await ctx.database.get('phimg_config', { groupId })
-    if (groupConfig) return groupConfig
-  
-    const defaultConfig = {
-      groupId,
-      enabled: config.enabledByDefault,
-      useGlobalTags: config.useGlobalTagsByDefault,
-      customTags: []
+    let [groupConfig] = await ctx.database.get('phimg_config', { groupId })
+    if (!groupConfig) {
+      try {
+        groupConfig = await ctx.database.create('phimg_config', {
+          groupId,
+          enabled: config.enabledByDefault,
+          useGlobalTags: config.useGlobalTagsByDefault,
+          customTags: []
+        })
+      } catch (e) {
+        [groupConfig] = await ctx.database.get('phimg_config', { groupId })
+      }
     }
-  
-    await ctx.database.create('phimg_config', defaultConfig)
-    return defaultConfig
+    return groupConfig
   }
 
   const updateGroupConfig = async (groupId: string, data: Partial<GroupConfig>) => {
+    await getGroupConfig(groupId)
     await ctx.database.set('phimg_config', { groupId }, data)
   }
 
-  const searchImages = async (tags: string[], apiKey: string) => {
-    const queryParams = new URLSearchParams()
-    queryParams.append('q', tags.join(','))
-    if (apiKey) queryParams.append('key', apiKey)
-    queryParams.append('sf', 'score')
-    queryParams.append('sd', 'desc')
-    queryParams.append('per_page', '50')
-
-    const url = `${config.apiUrl}${queryParams.toString()}`
+  const makeRequest = async (method: 'images' | 'reverse', params: any) => {
+    const host = config.apiUrl.replace(/^https?:\/\//, '').split('/')[0]
+    const endpoint = `https://${host}/api/v1/json/search/${method}`
     
+    const queryParams: any = {
+      filter_id: config.filterId
+    }
+    
+    if (params.key) {
+      queryParams.key = params.key
+      delete params.key
+    }
+
     try {
-      const axiosConfig = {
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'Phimg for Koishi'
-        },
-        timeout: 30000
-      }
-
-      if (config.proxy) {
-        axiosConfig['proxy'] = {
-          host: config.proxy.split(':')[1].replace('//', ''),
-          port: parseInt(config.proxy.split(':')[2]),
-          protocol: config.proxy.split(':')[0]
+      let responseData
+      if (method === 'images') {
+        responseData = await ctx.http.get(endpoint, {
+          params: { ...queryParams, ...params },
+          headers: { 'User-Agent': 'Phimg for Koishi' }
+        })
+      } else {
+        const formBody = new URLSearchParams()
+        for (const key in params) {
+          if (params[key] !== undefined && params[key] !== null) {
+            formBody.append(key, String(params[key]))
+          }
         }
+        responseData = await ctx.http.post(endpoint, formBody, {
+          params: queryParams,
+          headers: {
+            'User-Agent': 'Phimg for Koishi',
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+        })
       }
 
-      const response = await axios.get(url, axiosConfig)
-
-      if (response.data.total === 0) {
+      if (!responseData.images || responseData.images.length === 0) {
         throw new Error('未找到匹配的图片')
       }
 
-      return response.data.images
+      return responseData
     } catch (error) {
-      if (error.response?.status === 404) {
-        throw new Error('未找到匹配的图片')
+      const err = error as any
+      if (config.showErrorLog) {
+        ctx.logger('phimg').warn(`API Error: ${err?.message}`)
       }
-      throw new Error(error.message)
+      if (err?.response?.status === 404) throw new Error('未找到匹配的图片')
+      throw new Error(err?.message || 'API 请求失败')
     }
   }
 
-  const selectRandomImage = (images: any[]) => {
-    const index = randomInt(0, images.length)
-    const selected = images[index]
+  const VIDEO_TYPES = ['webm', 'mp4']
+
+  const getMediaElement = (selected: any) => {
+    if (!selected?.representations) return h.text('图片数据解析错误')
     const file = selected.representations.full
-
-    return {
-      url: file.endsWith('.webm') ? selected.representations.medium : selected.representations.large,
-      score: selected.score,
-      id: selected.id,
-      tags: selected.tags
-    }
+    const url = file.endsWith('.webm') ? selected.representations.medium : selected.representations.large
+    const fileType = file.split('.').pop()?.toLowerCase() || ''
+    if (VIDEO_TYPES.includes(fileType)) return h.video(url)
+    return h.image(url)
   }
 
-  const helpMessage = `用法: 搜图 [--add [&lt;tags&gt; ...]] [--rm [&lt;tags&gt; ...]] [--tags] [--on] [--off] [--status] [--onglobal] [--offglobal] [&lt;tags&gt;]
-选项:
-  --add [&lt;tags&gt; ...]       添加标签，多个标签用逗号分隔
-  --rm [&lt;tags&gt; ...]        删除标签，多个标签用逗号分隔
-  --tags            查看当前标签列表
-  --on              开启搜图功能
-  --off             关闭搜图功能
-  --onglobal        启用全局标签
-  --offglobal       禁用全局标签
-  --status          查看当前设置
+  const searchHelp = `用法: /搜图 [tags|distance]
+
+用法说明:
+  引用图片: 进行以图搜图 (默认距离 0.25)
+  直接发图: 发送指令时附带图片进行以图搜图
+  输入文本: 进行标签搜索
+
+可选项:
+  --tags             获取当前群聊内置标签列表
+  --status           获取当前群聊的搜图功能状态
+  --pp [num]         每页数量 (默认50)
+  --p [num]          页码 (默认1)
+  --sf [field]       排序字段 (默认score)
+  --sd [desc|asc]    排序方向 (默认desc)
+  --i [index]        选择结果索引 (默认随机)
 —————
 Powered by
 Phimg for Koishi @ CyanFlow`
 
-  ctx.command('搜图 <tags:text>', '从图站搜索图片')
-    .option('add', '--add <tags:text> 添加标签')
-    .option('rm', '--rm <tags:text> 删除标签')
-    .option('tags', '--tags 查看当前标签列表')
-    .option('on', '--on 开启搜图功能')
-    .option('off', '--off 关闭搜图功能')
-    .option('onglobal', '--onglobal 启用全局标签')
-    .option('offglobal', '--offglobal 禁用全局标签')
-    .option('status', '--status 查看当前设置')
-    .action(async ({ session, options }, tags) => {
-      if (!session?.guildId) return '搜图功能仅限群聊使用'
+  const configHelp = `用法: /搜图-c [选项]
+
+可选项:
+  --add [tags]       添加标签
+  --rm [tags]        删除标签
+  --on               开启搜图
+  --off              关闭搜图
+  --onglobal         启用全局标签
+  --offglobal        关闭全局标签
+—————
+Powered by
+Phimg for Koishi @ CyanFlow`
+
+  ctx.command('搜图 [...params]', '从图站搜索图片')
+    .option('tags', '--tags')
+    .option('status', '--status')
+    .option('pp', '--pp <per_page:number>', { fallback: 50 })
+    .option('p', '--p <page:number>', { fallback: 1 })
+    .option('sf', '--sf <sf:string>', { fallback: 'score' })
+    .option('sd', '--sd <sd:string>', { fallback: 'desc' })
+    .option('i', '--i <index:number>', { fallback: -1 })
+    .action(async ({ session, options }, ...paramsArray) => {
+      if (!session?.guildId) return '搜图仅限群聊使用。'
+
+      const opts = (options ?? {}) as {
+        tags?: boolean
+        status?: boolean
+        pp?: number
+        p?: number
+        sf?: string
+        sd?: string
+        i?: number
+      }
+      const content = session.content ?? ''
+      const rawParams = paramsArray.join(' ')
+      // 更新帮助逻辑：如果没参数、没引用、当前消息也没图片、没选项，则显示帮助
+      const hasImageInContent = !!(h.select(content, 'image')[0] || h.select(content, 'img')[0])
+      if (!rawParams && !session.quote && !hasImageInContent && !opts.tags && !opts.status) return searchHelp
 
       const groupId = session.guildId
       const groupConfig = await getGroupConfig(groupId)
 
-      if (!tags && Object.keys(options).length === 0) {
-        return helpMessage
+      if (opts.status) {
+        return `当前群聊搜图功能状态：\n启用：${groupConfig.enabled}\n标签：${groupConfig.customTags.join(', ') || '无'}\n全局标签：${groupConfig.useGlobalTags ? '启用' : '禁用'}`
       }
-
-      interface AuthUser {
-        authority?: number
+      if (opts.tags) {
+        return `当前群聊内置标签：${groupConfig.customTags.join(', ') || '无'}`
       }
-
-      const user = session.user as AuthUser | undefined
-
-      if (options.status) {
-        return `当前群聊搜图功能状态：
-启用: ${groupConfig.enabled}
-自定义标签: ${groupConfig.customTags.join(', ') || '无'}
-全局标签: ${groupConfig.useGlobalTags ? '启用' : '禁用'}`
-      }
-
-      if (options.on || options.off) {
-        if ((user?.authority ?? 0) < 2) {
-          return '只有管理员可以修改搜图设置'
-        }
-        const enabled = options.on ? true : false
-        await updateGroupConfig(groupId, { enabled })
-        return `搜图功能已在本群${enabled ? '开启' : '关闭'}`
-      }
-
       if (!groupConfig.enabled) {
-        return '搜图未在本群开启，管理员请用 "搜图 --on" 启动'
+        return '搜图未在本群开启，管理员请用 "搜图-c --on" 启动'
       }
 
-      if (options.onglobal || options.offglobal) {
-        if ((user?.authority ?? 0) < 2) {
-          return '只有管理员可以修改全局标签设置'
-        }
-        const useGlobalTags = options.onglobal ? true : false
-        await updateGroupConfig(groupId, { useGlobalTags })
-        return `全局标签已${useGlobalTags ? '启用' : '禁用'}`
+      const paramsText = translateText(rawParams || '')
+      const cleanParams = paramsText.replace(/<[^>]+>/g, '').trim()
+
+      let imageUrl: string | undefined
+      // 1. 优先检查引用消息中的图片
+      if (session.quote) {
+        const quoteContent = session.quote.content ?? ''
+        const img = h.select(quoteContent, 'image')[0] || h.select(quoteContent, 'img')[0]
+        if (img) imageUrl = img.attrs.url || img.attrs.src
+      }
+      // 2. 如果引用没图片，检查当前指令消息中是否附带了图片
+      if (!imageUrl) {
+        const img = h.select(content, 'image')[0] || h.select(content, 'img')[0]
+        if (img) imageUrl = img.attrs.url || img.attrs.src
       }
 
-      if (options.add || options.rm) {
-        if ((user?.authority ?? 0) < 2) {
-          return '只有管理员可以管理标签'
-        }
-
-        const tagsToModify = (options.add || options.rm).split(',').map(t => t.trim()).filter(t => t)
-        
-        if (options.add) {
-          const newTags = [...new Set([...groupConfig.customTags, ...tagsToModify])]
-          await updateGroupConfig(groupId, { customTags: newTags })
-          return `添加成功，本群标签现为: ${newTags.join(', ') || '无'}`
-        } else {
-          const newTags = groupConfig.customTags.filter(t => !tagsToModify.includes(t))
-          await updateGroupConfig(groupId, { customTags: newTags })
-          return `删除成功，本群标签现为: ${newTags.join(', ') || '无'}`
-        }
-      }
-
-      if (options.tags) {
-        return `当前群聊内置标签: ${groupConfig.customTags.join(', ') || '无'}`
-      }
-
-      if (!tags) {
-        return helpMessage
-      }
-
-      const userTags = tags ? tags.split(',').map(t => t.trim()).filter(t => t) : []
-      const globalTags = groupConfig.useGlobalTags ? config.defaultTags : []
-      const groupTags = groupConfig.customTags
-      
-      const allTags = [...new Set([...globalTags, ...groupTags, ...userTags])]
-      
       try {
-        const images = await searchImages(allTags, config.apiKey)
-        const selected = selectRandomImage(images)
-        
-        const infoText = `id: ${selected.id}\nscore: ${selected.score}\ntags: ${allTags.join(', ')}`
-        
-        if (selected.url.endsWith('.webm')) {
-          return segment.video(selected.url)
+        if (imageUrl) {
+          let distance = 0.25
+          if (cleanParams) {
+            const parsed = Number(cleanParams)
+            if (!isNaN(parsed)) {
+              distance = parsed
+            } else {
+              return '图片搜索仅支持数字参数，表示相似度距离（distance）。'
+            }
+          }
+
+          const queryParams: any = {
+            key: config.apiKey,
+            url: imageUrl,
+            distance: distance
+          }
+
+          const data = await makeRequest('reverse', queryParams)
+          const images = data.images
+
+          if (images.length > 10) return `搜索到过多图片 (${images.length} 张)，请尝试减小距离参数。`
+          if (images.length === 0) return '未找到匹配的图片'
+
+          const result: h[] = [h('at', { id: session.userId }), h.text(`\ndistance: ${distance}\n`)]
+          for (const img of images) {
+            result.push(getMediaElement(img))
+            result.push(h.text(`\nid: ${img.id} | score: ${img.score}\n`))
+          }
+          return result
+
         } else {
-          return segment.image(selected.url) + '\n' + infoText
+          const userTags = cleanParams ? cleanParams.split(/[,，]/).map(t => t.trim()).filter(t => t) : []
+          const globalTags = groupConfig.useGlobalTags ? config.defaultTags : []
+          const groupTags = groupConfig.customTags
+          const allTags = Array.from(new Set([...groupTags, ...globalTags, ...userTags]))
+
+          if (allTags.length === 0) return '请输入搜索标签。'
+
+          const perPage = opts.pp ?? 50
+          const queryParams: any = {
+            q: allTags.join(', '),
+            key: config.apiKey,
+            per_page: perPage,
+            page: opts.p ?? 1,
+            sf: opts.sf ?? 'score',
+            sd: opts.sd ?? 'desc',
+          }
+
+          const data = await makeRequest('images', queryParams)
+          const images = data.images
+
+          let index = opts.i ?? -1
+          let additionalMsg = ''
+          if (index < 0 || index >= images.length) {
+            if (index >= 0) additionalMsg = `索引 ${index} 超出单页范围，已随机选择图片`
+            index = Math.floor(Math.random() * images.length)
+          }
+
+          const selected = images[index]
+          const result: h[] = [
+            h('at', { id: session.userId }),
+            getMediaElement(selected),
+            h.text(`\nid: ${selected.id} | score: ${selected.score}`),
+            h.text(`\ntags: ${queryParams.q}`),
+          ]
+          if (additionalMsg) result.push(h.text(`\n提示：${additionalMsg}`))
+          return result
         }
       } catch (error) {
-        return error.message
+        return error instanceof Error ? error.message : String(error)
       }
+    })
+
+  const confirmOffGlobal = new Set<string>()
+
+  ctx.command('搜图-c', '配置搜图功能', { authority: 3 })
+    .option('on', '--on')
+    .option('off', '--off')
+    .option('onglobal', '--onglobal')
+    .option('offglobal', '--offglobal')
+    .option('add', '--add <tags:string>')
+    .option('rm', '--rm <tags:string>')
+    .action(async ({ session, options }) => {
+      if (!session?.guildId) return '搜图配置仅限群聊使用。'
+      const opts = (options ?? {}) as {
+        on?: boolean
+        off?: boolean
+        onglobal?: boolean
+        offglobal?: boolean
+        add?: string
+        rm?: string
+      }
+      if (Object.keys(opts).length === 0) return configHelp
+
+      const groupId = session.guildId
+      const groupConfig = await getGroupConfig(groupId)
+      let response = ''
+
+      if (opts.on && opts.off) return '不能同时开启和关闭搜图功能'
+
+      if (opts.on) {
+        await updateGroupConfig(groupId, { enabled: true })
+        response += '搜图功能已在本群开启\n'
+      } else if (opts.off) {
+        await updateGroupConfig(groupId, { enabled: false })
+        response += '搜图功能已在本群关闭\n'
+      }
+
+      if (opts.onglobal && opts.offglobal) return '不能同时开启和关闭全局标签'
+
+      if (opts.onglobal) {
+        await updateGroupConfig(groupId, { useGlobalTags: true })
+        response += '全局标签已启用\n'
+      } else if (opts.offglobal) {
+        const confirmKey = `${session.guildId}-${session.userId}`
+        if (!confirmOffGlobal.has(confirmKey)) {
+          confirmOffGlobal.add(confirmKey)
+          ctx.setTimeout(() => confirmOffGlobal.delete(confirmKey), 60000)
+          return '关闭全局标签，机器人将会搜出非safe图片\n请自行承担风险，再次输入指令确认关闭'
+        }
+        confirmOffGlobal.delete(confirmKey)
+        await updateGroupConfig(groupId, { useGlobalTags: false })
+        response += '全局标签已禁用\n'
+      }
+
+      if (opts.add || opts.rm) {
+        let newTags = [...groupConfig.customTags]
+        if (opts.add) {
+          const tagsToAdd = translateText(opts.add).split(/[,，]/).map(t => t.trim()).filter(t => t)
+          newTags = [...new Set([...newTags, ...tagsToAdd])]
+        }
+        if (opts.rm) {
+          const tagsToRm = translateText(opts.rm).split(/[,，]/).map(t => t.trim()).filter(t => t)
+          newTags = newTags.filter(t => !tagsToRm.includes(t))
+        }
+        await updateGroupConfig(groupId, { customTags: newTags })
+        response += `修改成功，本群标签现为: ${newTags.join(', ') || '无'}\n`
+      }
+
+      return response.trim()
     })
 }
