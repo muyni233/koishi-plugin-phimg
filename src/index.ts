@@ -47,6 +47,8 @@ interface GroupConfig {
   customTags: string[]
 }
 
+const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+
 export function apply(ctx: Context, config: Config) {
   ctx.model.extend('phimg_config', {
     id: 'unsigned',
@@ -95,12 +97,23 @@ export function apply(ctx: Context, config: Config) {
       delete params.key
     }
 
+    // 构建通用的伪装请求头
+    const commonHeaders = {
+      'User-Agent': BROWSER_UA,
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6',
+      'Referer': `https://${host}/`,
+      'Sec-Ch-Ua': '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': '"Windows"'
+    }
+
     try {
       let responseData
       if (method === 'images') {
         responseData = await ctx.http.get(endpoint, {
           params: { ...queryParams, ...params },
-          headers: { 'User-Agent': 'Phimg for Koishi' }
+          headers: commonHeaders
         })
       } else {
         const formBody = new URLSearchParams()
@@ -112,7 +125,7 @@ export function apply(ctx: Context, config: Config) {
         responseData = await ctx.http.post(endpoint, formBody, {
           params: queryParams,
           headers: {
-            'User-Agent': 'Phimg for Koishi',
+            ...commonHeaders,
             'Content-Type': 'application/x-www-form-urlencoded'
           }
         })
@@ -129,6 +142,7 @@ export function apply(ctx: Context, config: Config) {
         ctx.logger('phimg').warn(`API Error: ${err?.message}`)
       }
       if (err?.response?.status === 404) throw new Error('未找到匹配的图片')
+      if (err?.response?.status === 403) throw new Error('API请求被拒绝(403)')
       throw new Error(err?.message || 'API 请求失败')
     }
   }
