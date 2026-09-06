@@ -49,6 +49,13 @@ interface GroupConfig {
 
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 
+// 错误信息脱敏：隐藏 URL 中的 key / filter_id 等敏感参数，避免泄露到群聊或日志
+function sanitizeErrorMessage(message: string) {
+  return message
+    .replace(/([?&;])key=[^&\s'"<>]*/gi, '$1key=***')
+    .replace(/([?&;])filter_id=[^&\s'"<>]*/gi, '$1filter_id=***')
+}
+
 export function apply(ctx: Context, config: Config) {
   ctx.model.extend('phimg_config', {
     id: 'unsigned',
@@ -138,12 +145,13 @@ export function apply(ctx: Context, config: Config) {
       return responseData
     } catch (error) {
       const err = error as any
+      const message = sanitizeErrorMessage(String(err?.message ?? ''))
       if (config.showErrorLog) {
-        ctx.logger('phimg').warn(`API Error: ${err?.message}`)
+        ctx.logger('phimg').warn(`API Error: ${message}`)
       }
       if (err?.response?.status === 404) throw new Error('未找到匹配的图片')
       if (err?.response?.status === 403) throw new Error('API请求被拒绝(403)')
-      throw new Error(err?.message || 'API 请求失败')
+      throw new Error(message || 'API 请求失败')
     }
   }
 
