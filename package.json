@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-phimg",
   "description": "该插件可以让机器人通过Philomena API在使用Philomena搭建的图站上使用标签（tags）搜图",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
